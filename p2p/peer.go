@@ -2,11 +2,14 @@ package p2p
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +48,73 @@ func PeerIDFromString(s string) (PeerID, error) {
 // Equal reports whether two PeerID are equal.
 func (pid PeerID) Equal(other PeerID) bool {
 	return bytes.Equal(pid, other)
+}
+
+// PeerAddress is a peer address URL. The User field, if set, gives the
+// hex-encoded remote PeerID.
+type PeerAddress struct {
+	url.URL
+}
+
+// ParsePeerAddress parses a peer address URL into a PeerAddress.
+func ParsePeerAddress(address string) (PeerAddress, error) {
+	u, err := url.Parse(address)
+	if err != nil || u == nil {
+		return PeerAddress{}, fmt.Errorf("invalid peer address %q: %w", address, err)
+	}
+	// FIXME This needs additional validation, i.e. PeerAddress.Validate()
+	return PeerAddress{URL: *u}, nil
+}
+
+// Resolve resolves a PeerAddress into a set of Endpoints, by expanding
+// out a DNS name in Host to its IP addresses. Field mapping:
+//
+//   Scheme → Endpoint.Protocol
+//   Host   → Endpoint.IP
+//   User   → Endpoint.PeerID
+//   Port   → Endpoint.Port
+//   Path+Query+Fragment,Opaque → Endpoint.Path
+//
+func (a PeerAddress) Resolve(ctx context.Context) ([]Endpoint, error) {
+	var port uint16
+	if portString := a.Port(); portString != "" {
+		port64, err := strconv.ParseUint(portString, 10, 16)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port %q: %w", portString, err)
+		}
+		port = uint16(port64)
+	}
+
+	path := a.Path
+	if a.RawPath != "" {
+		path = a.RawPath
+	}
+	if a.Opaque != "" { // used for e.g. "about:blank" style URLs
+		path = a.Opaque
+	}
+	if a.RawQuery != "" {
+		path += "?" + a.RawQuery
+	}
+	if a.RawFragment != "" {
+		path += "#" + a.RawFragment
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", a.Host)
+	if err != nil {
+		return nil, err
+	}
+	endpoints := make([]Endpoint, 0, len(ips))
+	for _, ip := range ips {
+		endpoint := Endpoint{
+			PeerID:   ID(a.User.Username()),
+			Protocol: Protocol(a.Scheme),
+			IP:       ip,
+			Port:     port,
+			Path:     path,
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	return endpoints, nil
 }
 
 // PeerStatus specifies peer statuses.
