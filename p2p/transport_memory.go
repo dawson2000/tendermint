@@ -161,24 +161,12 @@ func (t *MemoryTransport) Dial(ctx context.Context, endpoint Endpoint) (Connecti
 
 	select {
 	case peerTransport.chAccept <- connIn:
+		return connOut, nil
 	case <-peerTransport.chClose:
 		return nil, ErrTransportClosed{}
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-
-	// We spawn a couple of goroutines that will close the other connection when
-	// one side is closed.
-	go func() {
-		<-connIn.chClose
-		connOut.Close()
-	}()
-	go func() {
-		<-connOut.chClose
-		connIn.Close()
-	}()
-
-	return connOut, nil
 }
 
 // DialAccept is a convenience function that dials B from A, and returns both
