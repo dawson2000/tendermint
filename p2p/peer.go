@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -60,10 +61,25 @@ type PeerAddress struct {
 func ParsePeerAddress(address string) (PeerAddress, error) {
 	u, err := url.Parse(address)
 	if err != nil || u == nil {
-		return PeerAddress{}, fmt.Errorf("invalid peer address %q: %w", address, err)
+		return PeerAddress{}, fmt.Errorf("unable to parse peer address %q: %w", address, err)
 	}
-	// FIXME This needs additional validation, i.e. PeerAddress.Validate()
-	return PeerAddress{URL: *u}, nil
+	if u.Scheme == "" {
+		u.Scheme = string(defaultProtocol)
+	}
+	pa := PeerAddress{URL: *u}
+	if err = pa.Validate(); err != nil {
+		return PeerAddress{}, err
+	}
+	return pa, nil
+}
+
+// PeerID returns the peer ID given in the address. Assumes Validate()
+// has been called first, thus returns nil on invalid ID.
+func (a PeerAddress) PeerID() PeerID {
+	if peerID, err := a.parseID(); err == nil {
+		return peerID
+	}
+	return nil
 }
 
 // Resolve resolves a PeerAddress into a set of Endpoints, by expanding
@@ -76,13 +92,13 @@ func ParsePeerAddress(address string) (PeerAddress, error) {
 //   Path+Query+Fragment,Opaque → Endpoint.Path
 //
 func (a PeerAddress) Resolve(ctx context.Context) ([]Endpoint, error) {
-	var port uint16
-	if portString := a.Port(); portString != "" {
-		port64, err := strconv.ParseUint(portString, 10, 16)
-		if err != nil {
-			return nil, fmt.Errorf("invalid port %q: %w", portString, err)
-		}
-		port = uint16(port64)
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", a.Host)
+	if err != nil {
+		return nil, err
+	}
+	port, err := a.parsePort()
+	if err != nil {
+		return nil, err
 	}
 
 	path := a.Path
@@ -99,10 +115,6 @@ func (a PeerAddress) Resolve(ctx context.Context) ([]Endpoint, error) {
 		path += "#" + a.RawFragment
 	}
 
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", a.Host)
-	if err != nil {
-		return nil, err
-	}
 	endpoints := make([]Endpoint, 0, len(ips))
 	for _, ip := range ips {
 		endpoint := Endpoint{
@@ -115,6 +127,50 @@ func (a PeerAddress) Resolve(ctx context.Context) ([]Endpoint, error) {
 		endpoints = append(endpoints, endpoint)
 	}
 	return endpoints, nil
+}
+
+// Validates validates a PeerAddress.
+func (a PeerAddress) Validate() error {
+	if a.Scheme == "" {
+		return errors.New("no protocol")
+	}
+	if peerID, err := a.parseID(); err != nil {
+		return err
+	} else if peerID == nil {
+		return errors.New("no peer ID")
+	}
+	if a.Hostname() == "" && len(a.Query()) == 0 && a.Opaque == "" {
+		return errors.New("no host or path given")
+	}
+	if port, err := a.parsePort(); err != nil {
+		return err
+	} else if port > 0 && a.Hostname() == "" {
+		return errors.New("cannot specify port without host")
+	}
+	return nil
+}
+
+// parseID parses the peer ID.
+func (a PeerAddress) parseID() (PeerID, error) {
+	if username := a.User.Username(); username == "" {
+		return nil, nil
+	} else if peerID, err := hex.DecodeString(username); err != nil {
+		return nil, fmt.Errorf("invalid peer ID %q: %w", username, err)
+	} else {
+		return PeerID(peerID), nil
+	}
+}
+
+// parsePort returns the port number as a uint16.
+func (a PeerAddress) parsePort() (uint16, error) {
+	if portString := a.Port(); portString != "" {
+		port64, err := strconv.ParseUint(portString, 10, 16)
+		if err != nil {
+			return 0, fmt.Errorf("invalid port %q: %w", portString, err)
+		}
+		return uint16(port64), nil
+	}
+	return 0, nil
 }
 
 // PeerStatus specifies peer statuses.
@@ -206,6 +262,115 @@ func (puc *PeerUpdatesCh) Done() <-chan struct{} {
 type PeerUpdate struct {
 	PeerID PeerID
 	Status PeerStatus
+}
+
+// peerStore manages information about peers.
+type peerStore struct {
+	logger log.Logger
+
+	mtx     sync.Mutex
+	peers   map[string]*sPeer
+	claimed map[string]bool
+}
+
+// newPeerStore creates a new peer store.
+func newPeerStore(logger log.Logger) *peerStore {
+	return &peerStore{
+		logger:  logger,
+		peers:   map[string]*sPeer{},
+		claimed: map[string]bool{},
+	}
+}
+
+// Add adds a peer to the store, given as an address.
+func (s *peerStore) Add(address PeerAddress) error {
+	if err := address.Validate(); err != nil {
+		return err
+	}
+	peerID := address.PeerID()
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	peer, ok := s.peers[peerID.String()]
+	if !ok {
+		peer = newSPeer(peerID)
+		s.peers[peerID.String()] = peer
+	} else if s.claimed[peerID.String()] {
+		// FIXME: Do something nicer here.
+		return fmt.Errorf("peer %q is claimed", peerID)
+	}
+	peer.AddAddress(address)
+	return nil
+}
+
+// Claim claims a peer. The caller has exclusive ownership of the peer, and must
+// return it by calling Return(). Returns nil if the peer could not be claimed.
+func (s *peerStore) Claim(id PeerID) *sPeer {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	key := id.String()
+	peer, ok := s.peers[key]
+	if !ok || s.claimed[key] {
+		return nil
+	}
+	s.claimed[key] = true
+	return peer
+}
+
+// Dispense finds an appropriate peer to contact and claims it. The caller has
+// exclusive ownership of the peer, and must return it by calling Return(). The
+// peer will not be dispensed again until returned.
+//
+// Returns nil if no appropriate peers are available.
+func (s *peerStore) Dispense() *sPeer {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	for key, peer := range s.peers {
+		if !s.claimed[key] {
+			s.claimed[key] = true
+			return peer
+		}
+	}
+	return nil
+}
+
+// Return returns a claimed peer, making it available for other
+// callers to use.
+func (s *peerStore) Return(id PeerID) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	delete(s.claimed, id.String())
+}
+
+// sPeer is a peer stored in the peerStore.
+// FIXME: This should be renamed peer once the old peer is removed.
+type sPeer struct {
+	ID        PeerID
+	Addresses []PeerAddress
+	Status    PeerStatus
+}
+
+// newSPeer creates a new sPeer.
+func newSPeer(id PeerID) *sPeer {
+	return &sPeer{
+		ID:        id,
+		Addresses: []PeerAddress{},
+		Status:    PeerStatusNew,
+	}
+}
+
+// AddAddress adds an address to a peer, unless it already exists.
+// It does not validate the address.
+// FIXME This violates
+func (p *sPeer) AddAddress(address PeerAddress) {
+	// We just do a linear search for now.
+	addressString := address.String()
+	for _, a := range p.Addresses {
+		if a.String() == addressString {
+			return
+		}
+	}
+	p.Addresses = append(p.Addresses, address)
 }
 
 // ============================================================================

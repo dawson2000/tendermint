@@ -11,6 +11,10 @@ import (
 	"github.com/tendermint/tendermint/p2p/conn"
 )
 
+const (
+	defaultProtocol Protocol = MConnProtocol
+)
+
 // Transport is an arbitrary mechanism for exchanging bytes with a peer.
 type Transport interface {
 	// Accept waits for the next inbound connection on a listening endpoint.

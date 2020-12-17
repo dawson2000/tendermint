@@ -9,12 +9,13 @@ import (
 	"github.com/tendermint/tendermint/libs/service"
 )
 
-// Router manages peer connections and routes messages between
-// peers and channels.
+// Router manages peer connections and routes messages between peers and
+// channels.
 type Router struct {
 	service.BaseService
 	logger     log.Logger
 	transports map[Protocol]Transport
+	store      *peerStore
 
 	closeCh chan struct{}
 
@@ -25,10 +26,19 @@ type Router struct {
 
 // NewRouter creates a new Router.
 func NewRouter(logger log.Logger, transports map[Protocol]Transport, peers []PeerAddress) *Router {
+	store := newPeerStore(logger)
+	for _, address := range peers {
+		if err := store.Add(address); err != nil {
+			logger.Error("failed to add peer", "address", address, "err", err)
+		}
+	}
 	return &Router{
-		logger:     logger,
-		transports: transports,
-		channels:   map[ChannelID]*Channel{},
+		logger:      logger,
+		transports:  transports,
+		store:       store,
+		closeCh:     make(chan struct{}),
+		channels:    map[ChannelID]*Channel{},
+		peerUpdates: map[*PeerUpdatesCh]*PeerUpdatesCh{},
 	}
 }
 
@@ -69,5 +79,5 @@ func (r *Router) OnStart() error {
 
 // OnStop implements service.Service.
 func (r *Router) OnStop() {
-
+	close(r.closeCh)
 }
