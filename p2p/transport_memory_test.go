@@ -14,15 +14,12 @@ var ctx = context.Background()
 
 func TestMemoryTransport(t *testing.T) {
 	network := p2p.NewMemoryNetwork(log.TestingLogger())
-	a, err := network.GenerateTransport()
-	require.NoError(t, err)
-	b, err := network.GenerateTransport()
-	require.NoError(t, err)
-	c, err := network.GenerateTransport()
-	require.NoError(t, err)
+	a := network.GenerateTransport()
+	b := network.GenerateTransport()
+	c := network.GenerateTransport()
 
 	// Dialing a missing endpoint should fail.
-	_, err = a.Dial(ctx, p2p.Endpoint{
+	_, err := a.Dial(ctx, p2p.Endpoint{
 		Protocol: p2p.MemoryProtocol,
 		PeerID:   p2p.ID("foo"),
 		Path:     "foo",
@@ -103,4 +100,23 @@ func TestMemoryTransport(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, ch)
 	require.EqualValues(t, "foo", msg)
+
+	// If we close the c transport, it will no longer accept connections,
+	// but we can still use the open connection.
+	endpoint := c.Endpoints()[0]
+	err = c.Close()
+	require.NoError(t, err)
+	require.Empty(t, c.Endpoints())
+
+	_, err = a.Dial(ctx, endpoint)
+	require.Error(t, err)
+
+	sent, err = aToC.SendMessage(1, []byte("bar"))
+	require.NoError(t, err)
+	require.True(t, sent)
+
+	ch, msg, err = cToA.ReceiveMessage()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, ch)
+	require.EqualValues(t, "bar", msg)
 }
