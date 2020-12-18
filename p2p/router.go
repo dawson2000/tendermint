@@ -13,6 +13,13 @@ import (
 	"github.com/tendermint/tendermint/libs/service"
 )
 
+// rawEnvelope is an envelope used to route raw messages internally in the router.
+type rawEnvelope struct {
+	channel ChannelID
+	peer    PeerID // either sender or recipient depending on direction
+	message []byte
+}
+
 // Router manages peer connections and routes messages between peers and
 // channels.
 type Router struct {
@@ -21,11 +28,14 @@ type Router struct {
 	transports map[Protocol]Transport
 	store      *peerStore
 
-	chClose chan struct{}
-	wg      sync.WaitGroup
+	chClose    chan struct{}
+	wgChannels sync.WaitGroup
+	wgPeers    sync.WaitGroup
 
+	// FIXME: should use a finer-grained mutex, e.g. one per resource type.
 	mtx         sync.RWMutex
-	channels    map[ChannelID]*Channel
+	channels    map[ChannelID]chan<- rawEnvelope
+	peers       map[string]chan<- rawEnvelope
 	peerUpdates map[*PeerUpdatesCh]*PeerUpdatesCh // keyed by struct identity (address)
 }
 
@@ -42,7 +52,7 @@ func NewRouter(logger log.Logger, transports map[Protocol]Transport, peers []Pee
 		transports:  transports,
 		store:       store,
 		chClose:     make(chan struct{}),
-		channels:    map[ChannelID]*Channel{},
+		channels:    map[ChannelID]chan<- rawEnvelope{},
 		peerUpdates: map[*PeerUpdatesCh]*PeerUpdatesCh{},
 	}
 	router.BaseService = service.NewBaseService(logger, "router", router)
@@ -56,9 +66,22 @@ func (r *Router) OpenChannel(id ChannelID, messageType proto.Message) (*Channel,
 	if _, ok := r.channels[id]; ok {
 		return nil, fmt.Errorf("channel %v already in use", id)
 	}
-	ch := NewChannel(id, messageType, make(chan Envelope), make(chan Envelope), make(chan PeerError))
-	r.channels[id] = ch
-	return ch, nil
+
+	channel := NewChannel(id, messageType, make(chan Envelope), make(chan Envelope), nil) // FIXME: handle PeerError
+	inScheduler := newFIFOScheduler(1000)
+	r.channels[id] = inScheduler.enqueue()
+	r.wgChannels.Add(1)
+	go r.sendChannel(channel, inScheduler.dequeue())
+	go r.receiveChannel(channel)
+	go func() {
+		<-channel.doneCh
+		r.mtx.Lock()
+		delete(r.channels, id)
+		r.mtx.Unlock()
+		r.wgChannels.Done()
+	}()
+
+	return channel, nil
 }
 
 // SubscribePeerUpdates creates a new peer updates subscription.
@@ -113,12 +136,12 @@ func (r *Router) acceptPeers(transport Transport) {
 			continue
 		}
 
-		r.wg.Add(1)
+		r.wgPeers.Add(1)
 		go func() {
-			defer r.wg.Done()
+			defer r.wgPeers.Done()
 			defer r.store.Return(peer.ID)
 			defer conn.Close()
-			err = r.routePeer(peer, conn)
+			err = r.receivePeer(peer, conn)
 			if err != nil {
 				r.logger.Error("peer failure", "peer", peer.ID, "err", err)
 			}
@@ -143,9 +166,9 @@ func (r *Router) dialPeers() {
 			continue
 		}
 
-		r.wg.Add(1)
+		r.wgPeers.Add(1)
 		go func() {
-			defer r.wg.Done()
+			defer r.wgPeers.Done()
 			defer r.store.Return(peer.ID)
 			conn, err := r.dialPeer(peer)
 			if err != nil {
@@ -153,7 +176,7 @@ func (r *Router) dialPeers() {
 				return
 			}
 			defer conn.Close()
-			err = r.routePeer(peer, conn)
+			err = r.receivePeer(peer, conn)
 			if err != nil {
 				r.logger.Error("peer failure", "peer", peer.ID, "err", err)
 			}
@@ -200,17 +223,101 @@ func (r *Router) dialPeer(peer *sPeer) (Connection, error) {
 	return nil, errors.New("failed to connect to peer")
 }
 
-// routePeer routes messages for a peer across a connection.
-func (r *Router) routePeer(peer *sPeer, conn Connection) error {
+// receivePeer receives inbound messages from a peer.
+func (r *Router) receivePeer(peer *sPeer, conn Connection) error {
 	for {
-		ch, msg, err := conn.ReceiveMessage()
+		chID, bz, err := conn.ReceiveMessage()
 		if err == io.EOF {
 			r.logger.Info("disconnected from peer", "peer", peer.ID)
 			return nil
 		} else if err != nil {
 			return err
 		}
-		r.logger.Info("received message", "peer", peer.ID, "channel", ch, "message", msg)
+
+		// FIXME: Avoid mutex here.
+		r.mtx.RLock()
+		ch, ok := r.channels[ChannelID(chID)]
+		r.mtx.RUnlock()
+		if !ok {
+			r.logger.Error("dropping message for unknown channel", "peer", peer.ID, "channel", ch)
+			continue
+		}
+
+		select {
+		case ch <- rawEnvelope{channel: ChannelID(chID), peer: peer.ID, message: bz}:
+		case <-r.chClose:
+			return nil
+		}
+	}
+}
+
+// sendChannel sends inbound messages to a channel until either in or the
+// destination channel is closed.
+func (r *Router) sendChannel(channel *Channel, in <-chan rawEnvelope) {
+	emptyMessage := proto.Clone(channel.messageType)
+	emptyMessage.Reset()
+	for {
+		select {
+		case raw, ok := <-in:
+			if !ok {
+				return
+			}
+			msg := proto.Clone(emptyMessage)
+			if err := proto.Unmarshal(raw.message, msg); err != nil {
+				r.logger.Error("message decoding failed", "peer", raw.peer, "err", err)
+				continue
+			}
+
+			select {
+			case channel.outCh <- Envelope{From: raw.peer, Message: msg}:
+				r.logger.Info("received message", "peer", raw.peer, "channel", channel.ID, "message", msg)
+			case <-channel.doneCh:
+				return
+			case <-r.chClose:
+				return
+			}
+		case <-channel.doneCh:
+			return
+		case <-r.chClose:
+			return
+		}
+	}
+}
+
+// receiveChannel receives outbound messages from a channel and sends them to the
+// appropriate peer.
+func (r *Router) receiveChannel(channel *Channel) {
+	for {
+		select {
+		case envelope, ok := <-channel.outCh:
+			if !ok {
+				return
+			}
+			r.mtx.Lock()
+			ch, ok := r.peers[envelope.To.String()]
+			r.mtx.Unlock()
+			if !ok {
+				r.logger.Error("dropping message for disconnected peer", "peer", envelope.To.String())
+				continue
+			}
+
+			bz, err := proto.Marshal(envelope.Message)
+			if err != nil {
+				r.logger.Error("failed to marshal message", "peer", envelope.To.String(), "err", err)
+				continue
+			}
+			select {
+			case ch <- rawEnvelope{peer: envelope.To, message: bz}:
+			case <-channel.doneCh:
+				return
+			case <-r.chClose:
+				return
+			}
+		case <-channel.doneCh:
+			return
+		case <-r.chClose:
+			return
+		}
 	}
 }
 
@@ -226,5 +333,5 @@ func (r *Router) OnStart() error {
 // OnStop implements service.Service.
 func (r *Router) OnStop() {
 	close(r.chClose)
-	r.wg.Wait()
+	r.wgPeers.Wait()
 }
