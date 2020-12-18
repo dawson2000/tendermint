@@ -2,7 +2,9 @@ package p2p
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -77,8 +79,55 @@ func (r *Router) SubscribePeerUpdates() (*PeerUpdatesCh, error) {
 	return peerUpdates, nil
 }
 
-// processPeers maintains connections between peers.
-func (r *Router) processPeers() {
+// acceptPeers accepts inbound connections from peers on the given transport.
+func (r *Router) acceptPeers(transport Transport) {
+	for {
+		select {
+		case <-r.chClose:
+			return
+		default:
+		}
+
+		conn, err := transport.Accept(context.Background())
+		switch err {
+		case ErrTransportClosed{}:
+			return
+		case io.EOF:
+			return
+		case nil:
+		default:
+			r.logger.Error("failed to accept connection", "err", err)
+			return
+		}
+
+		peerID, err := conn.NodeInfo().DefaultNodeID.ToPeerID()
+		if err != nil {
+			r.logger.Error("invalid peer ID", "peer", conn.NodeInfo().DefaultNodeID)
+			_ = conn.Close()
+			continue
+		}
+		peer := r.store.Claim(peerID)
+		if peer == nil {
+			r.logger.Error("already connected to peer, rejecting connection", "peer", peerID)
+			_ = conn.Close()
+			continue
+		}
+
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			defer r.store.Return(peer.ID)
+			defer conn.Close()
+			err = r.routePeer(peer, conn)
+			if err != nil {
+				r.logger.Error("peer failure", "peer", peer.ID, "err", err)
+			}
+		}()
+	}
+}
+
+// dialPeers maintains outbound connections to peers.
+func (r *Router) dialPeers() {
 	for {
 		select {
 		case <-r.chClose:
@@ -88,21 +137,32 @@ func (r *Router) processPeers() {
 
 		peer := r.store.Dispense()
 		if peer == nil {
+			// no dispensed peers, sleep for a while
+			r.logger.Info("no eligible peers, sleeping")
 			time.Sleep(time.Second)
 			continue
 		}
-		go r.processPeer(peer)
+
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			defer r.store.Return(peer.ID)
+			conn, err := r.dialPeer(peer)
+			if err != nil {
+				r.logger.Error("failed to dial peer, will retry", "peer", peer.ID)
+				return
+			}
+			defer conn.Close()
+			err = r.routePeer(peer, conn)
+			if err != nil {
+				r.logger.Error("peer failure", "peer", peer.ID, "err", err)
+			}
+		}()
 	}
 }
 
-// processPeer manages a single peer.
-func (r *Router) processPeer(peer *sPeer) {
-	r.wg.Add(1)
-	defer func() {
-		r.store.Return(peer.ID)
-		r.wg.Done()
-	}()
-	r.logger.Info("contacting peer", "peer", peer.ID)
+// dialPeer attempts to connect to a peer.
+func (r *Router) dialPeer(peer *sPeer) (Connection, error) {
 	ctx := context.Background()
 
 	r.logger.Info("resolving peer endpoints", "peer", peer.ID)
@@ -118,36 +178,48 @@ func (r *Router) processPeer(peer *sPeer) {
 		endpoints = append(endpoints, e...)
 	}
 	if len(endpoints) == 0 {
-		r.logger.Error("unable to resolve network endpoints", "peer", peer.ID)
-		return
+		return nil, errors.New("unable to resolve any network endpoints")
 	}
 
-	var conn Connection
 	for _, endpoint := range endpoints {
 		t, ok := r.transports[endpoint.Protocol]
 		if !ok {
 			r.logger.Error("no transport found for protocol", "protocol", endpoint.Protocol)
+			continue
 		}
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		var err error
-		conn, err = t.Dial(ctx, endpoint)
+		conn, err := t.Dial(ctx, endpoint)
 		if err != nil {
 			r.logger.Error("failed to dial endpoint", "endpoint", endpoint)
-			continue
+		} else {
+			r.logger.Info("connected to peer", "peer", peer.ID, "endpoint", endpoint)
+			return conn, nil
 		}
-		r.logger.Info("connected to peer", "peer", peer.ID, "endpoint", endpoint)
-		break
 	}
-	if conn == nil {
-		r.logger.Error("failed to connect to peer", "peer", peer.ID)
-		return
+	return nil, errors.New("failed to connect to peer")
+}
+
+// routePeer routes messages for a peer across a connection.
+func (r *Router) routePeer(peer *sPeer, conn Connection) error {
+	for {
+		ch, msg, err := conn.ReceiveMessage()
+		if err == io.EOF {
+			r.logger.Info("disconnected from peer", "peer", peer.ID)
+			return nil
+		} else if err != nil {
+			return err
+		}
+		r.logger.Info("received message", "peer", peer.ID, "channel", ch, "message", msg)
 	}
 }
 
 // OnStart implements service.Service.
 func (r *Router) OnStart() error {
-	go r.processPeers()
+	go r.dialPeers()
+	for _, transport := range r.transports {
+		go r.acceptPeers(transport)
+	}
 	return nil
 }
 

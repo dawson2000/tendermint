@@ -13,6 +13,11 @@ import (
 // ID is a hex-encoded crypto.Address
 type ID string
 
+// FIXME: shouldn't be used.
+func (id ID) ToPeerID() (PeerID, error) {
+	return hex.DecodeString(string(id))
+}
+
 // IDByteLength is the length of a crypto.Address. Currently only 20.
 // TODO: support other length addresses ?
 const IDByteLength = crypto.AddressSize

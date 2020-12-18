@@ -18,9 +18,25 @@ func TestRouter(t *testing.T) {
 	b := network.GenerateTransport()
 	c := network.GenerateTransport()
 
-	go func() { _, _ = a.Accept(context.Background()) }()
-	go func() { _, _ = b.Accept(context.Background()) }()
-	go func() { _, _ = c.Accept(context.Background()) }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runPeer := func(transport p2p.Transport) {
+		for {
+			conn, err := transport.Accept(ctx)
+			if err == context.Canceled {
+				return
+			}
+			require.NoError(t, err)
+			sent, err := conn.SendMessage(1, []byte("hi!"))
+			require.True(t, sent)
+			require.NoError(t, err)
+			conn.Close()
+		}
+	}
+	go runPeer(a)
+	go runPeer(b)
+	go runPeer(c)
 
 	router := p2p.NewRouter(logger, map[p2p.Protocol]p2p.Transport{
 		p2p.MemoryProtocol: transport,
@@ -31,7 +47,7 @@ func TestRouter(t *testing.T) {
 	})
 	err := router.Start()
 	require.NoError(t, err)
-	defer require.NoError(t, router.Stop())
+	defer func() { require.NoError(t, router.Stop()) }()
 
 	time.Sleep(3 * time.Second)
 }
