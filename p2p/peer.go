@@ -54,7 +54,7 @@ func (pid PeerID) Equal(other PeerID) bool {
 // PeerAddress is a peer address URL. The User field, if set, gives the
 // hex-encoded remote PeerID.
 type PeerAddress struct {
-	url.URL
+	*url.URL
 }
 
 // ParsePeerAddress parses a peer address URL into a PeerAddress.
@@ -66,7 +66,7 @@ func ParsePeerAddress(address string) (PeerAddress, error) {
 	if u.Scheme == "" {
 		u.Scheme = string(defaultProtocol)
 	}
-	pa := PeerAddress{URL: *u}
+	pa := PeerAddress{URL: u}
 	if err = pa.Validate(); err != nil {
 		return PeerAddress{}, err
 	}

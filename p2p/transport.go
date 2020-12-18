@@ -64,21 +64,27 @@ type Endpoint struct {
 	Port uint16
 }
 
-// String formats an endpoint as a URL string.
-func (e Endpoint) String() string {
-	u := url.URL{Scheme: string(e.Protocol)}
-	if e.PeerID != "" {
-		u.User = url.User(string(e.PeerID))
+// PeerAddress converts the endpoint into a peer address URL.
+func (e Endpoint) PeerAddress() PeerAddress {
+	u := &url.URL{
+		Scheme: string(e.Protocol),
+		User:   url.User(string(e.PeerID)),
 	}
-	if len(e.IP) > 0 {
+	if e.IP != nil {
 		u.Host = e.IP.String()
 		if e.Port > 0 {
 			u.Host += fmt.Sprintf(":%v", e.Port)
 		}
-	} else if e.Path != "" {
+		u.Path = e.Path
+	} else {
 		u.Opaque = e.Path
 	}
-	return u.String()
+	return PeerAddress{URL: u}
+}
+
+// String formats an endpoint as a URL string.
+func (e Endpoint) String() string {
+	return e.PeerAddress().URL.String()
 }
 
 // Validate validates an endpoint.
